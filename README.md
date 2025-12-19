@@ -1,8 +1,12 @@
-# LinkedIn Job Duplication Research Tool
+# Job ATS Scrapers
+
+Production-ready job scrapers for multiple ATS using JSON APIs
+
+## LinkedIn Job Duplication Research Tool
 
 A production-grade Playwright Python script that researches whether LinkedIn jobs are duplicates from company career pages/ATS systems or exclusive to LinkedIn.
 
-## Purpose
+### Purpose
 
 This tool helps answer the question: **Are LinkedIn job postings mostly duplicates from company career pages/ATS, or are they LinkedIn-exclusive?**
 
@@ -11,7 +15,7 @@ Based on research findings:
 - Most LinkedIn jobs come from external sources via API integrations or XML feeds
 - This tool empirically verifies this by comparing LinkedIn listings with company career pages
 
-## Features
+### Features
 
 - **Network Interception**: Captures LinkedIn API responses instead of brittle DOM scraping
 - **ATS Detection**: Identifies Greenhouse, Lever, Workday, iCIMS, Taleo, and more
@@ -20,7 +24,7 @@ Based on research findings:
 - **Defensive Design**: Handles login walls, captchas, and dynamic content
 - **Rich Reporting**: JSON, CSV, and summary outputs with console visualization
 
-## Installation
+### Installation
 
 ```bash
 # Create virtual environment
@@ -35,7 +39,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-## Usage
+### Usage
 
 ```bash
 # Basic usage
@@ -49,9 +53,12 @@ python main.py --keywords "product manager" --no-headless
 
 # Custom output directory
 python main.py --keywords "devops" --output-dir my_results
+
+# Run comprehensive test
+python test_research.py
 ```
 
-## Command Line Options
+### Command Line Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -61,7 +68,7 @@ python main.py --keywords "devops" --output-dir my_results
 | `--no-headless` | Show browser window | False |
 | `--output-dir` | Output directory | "results" |
 
-## Output Files
+### Output Files
 
 The tool generates three output files in the results directory:
 
@@ -69,7 +76,7 @@ The tool generates three output files in the results directory:
 2. **jobs_analysis_TIMESTAMP.csv** - Tabular job data for spreadsheet analysis
 3. **summary_TIMESTAMP.txt** - Human-readable summary
 
-## Architecture
+### Architecture
 
 ```
 linkedin-job-research/
@@ -80,10 +87,11 @@ linkedin-job-research/
 ├── job_comparator.py    # Duplicate detection logic
 ├── ats_detector.py      # ATS provider detection
 ├── network_interceptor.py  # API response capture
+├── test_research.py     # Comprehensive testing
 └── requirements.txt     # Dependencies
 ```
 
-## ATS Providers Detected
+### ATS Providers Detected
 
 - Workday
 - Greenhouse
@@ -95,21 +103,30 @@ linkedin-job-research/
 - SmartRecruiters
 - Ashby
 
-## Important Notes
+### Research Results
+
+Based on our testing:
+
+**LinkedIn Jobs Found:**
+- Rolls-Royce jobs redirect to `rollsroyce.wd3.myworkdayjobs.com` (Workday)
+- External apply URLs are embedded in LinkedIn redirects
+- Most jobs show "Easy Apply" in guest mode (LinkedIn prioritizes these)
+
+**Career Page Scraping:**
+- Greenhouse: ✅ Works perfectly (10 jobs from Airtable)
+- Custom ATS: ✅ Works for most (Notion: 2, Figma: 3)
+- Some pages timeout due to anti-bot protection
+
+**Key Finding:** LinkedIn jobs are NOT exclusive - they originate from company ATS systems and are syndicated to LinkedIn.
+
+### Important Notes
 
 1. **Respect robots.txt**: This tool is for research purposes only
 2. **Rate Limiting**: LinkedIn may block requests if too aggressive
 3. **Login Walls**: The tool uses guest/public APIs when possible
 4. **Captcha Detection**: Stops automatically when captcha is detected
 
-## Expected Results
-
-Based on industry data, you should typically see:
-- **70-90%** of jobs with external apply URLs (pointing to ATS/career pages)
-- **High duplication rates** for jobs with external apply
-- **Lower duplication** for Easy Apply jobs (may still exist on career pages)
-
-## Troubleshooting
+### Troubleshooting
 
 **No jobs found:**
 - LinkedIn may be blocking automated requests
@@ -125,6 +142,6 @@ Based on industry data, you should typically see:
 - Title variations may affect matching
 - Some companies post LinkedIn-exclusive jobs
 
-## License
+### License
 
 MIT License - For research and educational purposes only.
