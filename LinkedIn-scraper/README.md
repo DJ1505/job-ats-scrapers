@@ -4,123 +4,151 @@ A production-grade Playwright Python script that researches whether LinkedIn job
 
 ## Purpose
 
-This tool helps answer the question: **Are LinkedIn job postings mostly duplicates from company career pages/ATS, or are they LinkedIn-exclusive?**
+Extract LinkedIn jobs **without login**, **without brittle HTML scraping**, and with **minimal browser interaction** — while correctly handling ATS-based companies and LinkedIn-only startups.
 
-Based on research findings:
-- LinkedIn has two job types: **Basic Jobs** (free, aggregated from ATS/career pages) and **Promoted Jobs** (paid)
-- Most LinkedIn jobs come from external sources via API integrations or XML feeds
-- This tool empirically verifies this by comparing LinkedIn listings with company career pages
+## Architecture
 
-## Features
+### API-First Strategy
 
-- **Network Interception**: Captures LinkedIn API responses instead of brittle DOM scraping
-- **ATS Detection**: Identifies Greenhouse, Lever, Workday, iCIMS, Taleo, and more
-- **Career Page Scraping**: Extracts jobs from detected ATS providers
-- **Fuzzy Matching**: Compares job titles and descriptions to detect duplicates
-- **Defensive Design**: Handles login walls, captchas, and dynamic content
-- **Rich Reporting**: JSON, CSV, and summary outputs with console visualization
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Job Ingestion Pipeline                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. LINKEDIN DISCOVERY (Network Interception)                   │
+│     └── Guest APIs: /jobs-guest/jobs/api/*, /voyager/api/*     │
+│                                                                  │
+│  2. JOB CLASSIFICATION                                          │
+│     ├── ATS Jobs (external apply URL) → Fetch from ATS API     │
+│     └── LinkedIn-Native (Easy Apply) → Accept as final         │
+│                                                                  │
+│  3. ATS INGESTION (JSON APIs - No Browser)                      │
+│     ├── Greenhouse API                                          │
+│     ├── Lever API                                               │
+│     ├── Workday API                                             │
+│     ├── Ashby API                                               │
+│     └── SmartRecruiters API                                     │
+│                                                                  │
+│  4. DEDUPLICATION & NORMALIZATION                               │
+│     └── Unified job schema with job_origin classification       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Principles
+
+- **LinkedIn Guest APIs** are the PRIMARY data source
+- **No DOM scraping** for job data (only for triggering API calls)
+- **Immediate abort** on authwall/login/captcha detection
+- **Rate limiting** between requests
+- **ATS JSON APIs** are source of truth for ATS companies
+
+## Job Origin Classification
+
+Every job is classified as:
+
+| Origin | Description | Handling |
+|--------|-------------|----------|
+| `ATS` | External apply URL redirects to ATS | Fetch from ATS JSON API |
+| `LINKEDIN_NATIVE` | Easy Apply or no external URL | Accept LinkedIn API data |
 
 ## Installation
 
 ```bash
-# Create virtual environment
-python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Linux/Mac
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Install Playwright browsers
 playwright install chromium
 ```
 
 ## Usage
 
 ```bash
-# Basic usage
-python main.py --keywords "software engineer" --max-jobs 10
+# Basic search
+python main.py --keywords "software engineer" --location "San Francisco"
 
-# With location filter
-python main.py --keywords "data scientist" --location "New York" --max-jobs 20
+# More jobs
+python main.py --keywords "data scientist" --max-jobs 30
+
+# Skip ATS fetching (LinkedIn only)
+python main.py --keywords "product manager" --no-ats
 
 # Debug mode (visible browser)
-python main.py --keywords "product manager" --no-headless
-
-# Custom output directory
-python main.py --keywords "devops" --output-dir my_results
-
-# Run comprehensive test
-python test_research.py
+python main.py --no-headless
 ```
 
-## Command Line Options
+## Output Schema
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--keywords` | Job search keywords | "software engineer" |
-| `--location` | Location filter | "" (any) |
-| `--max-jobs` | Maximum jobs to analyze | 10 |
-| `--no-headless` | Show browser window | False |
-| `--output-dir` | Output directory | "results" |
+Each extracted job includes:
 
-## Output Files
-
-The tool generates three output files in the results directory:
-
-1. **research_report_TIMESTAMP.json** - Full structured report
-2. **jobs_analysis_TIMESTAMP.csv** - Tabular job data for spreadsheet analysis
-3. **summary_TIMESTAMP.txt** - Human-readable summary
-
-## Architecture
-
-```
-LinkedIn-scraper/
-├── main.py              # Entry point and CLI
-├── schemas.py           # Pydantic data models
-├── linkedin_scraper.py  # LinkedIn job extraction
-├── career_page_scraper.py  # ATS/career page extraction
-├── job_comparator.py    # Duplicate detection logic
-├── ats_detector.py      # ATS provider detection
-├── network_interceptor.py  # API response capture
-├── test_research.py     # Comprehensive testing
-└── requirements.txt     # Dependencies
+```json
+{
+  "job_id": "12345",
+  "title": "Software Engineer",
+  "company_name": "Tech Corp",
+  "location": "San Francisco, CA",
+  "apply_url": "https://boards.greenhouse.io/techcorp/jobs/12345",
+  "ats_provider": "greenhouse",
+  "job_origin": "ATS",
+  "source_url": "https://linkedin.com/jobs/view/12345",
+  "extracted_at": "2024-01-15T10:30:00Z",
+  "extraction_method": "ats_api"
+}
 ```
 
-## ATS Providers Detected
+## Safety Controls
 
-- Workday
-- Greenhouse
-- Lever
-- iCIMS
-- Taleo/Oracle
-- BambooHR
-- Jobvite
-- SmartRecruiters
-- Ashby
+| Control | Implementation |
+|---------|---------------|
+| No Login | Guest APIs only |
+| No Cookies | No credential storage |
+| Block Detection | Immediate abort on authwall/captcha |
+| Rate Limiting | 2000ms between requests |
+| Headless Mode | Default for stealth |
+| Minimal Navigation | Search page only |
 
-## Research Results
+## Supported ATS Providers
 
-Based on our testing:
+| Provider | API Support | Detection Pattern |
+|----------|-------------|-------------------|
+| Greenhouse | ✅ JSON API | `boards.greenhouse.io` |
+| Lever | ✅ JSON API | `jobs.lever.co` |
+| Workday | ✅ JSON API | `*.myworkdayjobs.com` |
+| Ashby | ✅ JSON API | `jobs.ashbyhq.com` |
+| SmartRecruiters | ✅ JSON API | `jobs.smartrecruiters.com` |
+| iCIMS | Network only | `*.icims.com` |
+| Taleo | Network only | `*.taleo.net` |
+| BambooHR | Network only | `*.bamboohr.com` |
+| Jobvite | Network only | `*.jobvite.com` |
 
-**LinkedIn Jobs Found:**
-- Rolls-Royce jobs redirect to `rollsroyce.wd3.myworkdayjobs.com` (Workday)
-- External apply URLs are embedded in LinkedIn redirects
-- Most jobs show "Easy Apply" in guest mode (LinkedIn prioritizes these)
+## Test Cases
 
-**Career Page Scraping:**
-- Greenhouse: ✅ Works perfectly (10 jobs from Airtable)
-- Custom ATS: ✅ Works for most (Notion: 2, Figma: 3)
-- Some pages timeout due to anti-bot protection
+Run tests with:
+```bash
+python -m pytest test_pipeline.py -v
+```
 
-**Key Finding:** LinkedIn jobs are NOT exclusive - they originate from company ATS systems and are syndicated to LinkedIn.
+| Test | Description |
+|------|-------------|
+| ATS (Greenhouse) | Jobs fetched via JSON API, marked as ATS |
+| ATS (Workday) | Network interception captures API |
+| LinkedIn-Native | Easy Apply accepted, no external scraping |
+| Block Detection | Authwall/captcha triggers immediate stop |
+| Mixed Companies | ATS + LinkedIn-native handled correctly |
 
-## Important Notes
+## Project Structure
 
-1. **Respect robots.txt**: This tool is for research purposes only
-2. **Rate Limiting**: LinkedIn may block requests if too aggressive
-3. **Login Walls**: The tool uses guest/public APIs when possible
-4. **Captcha Detection**: Stops automatically when captcha is detected
+```
+├── main.py                 # CLI entry point
+├── job_pipeline.py         # Pipeline orchestrator
+├── linkedin_scraper.py     # LinkedIn network interception
+├── ats_scraper.py          # ATS scraping (API-first)
+├── ats_clients.py          # JSON API clients
+├── ats_detector.py         # ATS provider detection
+├── network_interceptor.py  # Network capture + block detection
+├── schemas.py              # Pydantic data models
+├── job_comparator.py       # Duplicate detection
+├── test_pipeline.py        # Test cases
+└── requirements.txt        # Dependencies
+```
 
 ## Troubleshooting
 
@@ -129,14 +157,10 @@ Based on our testing:
 - Try `--no-headless` to see what's happening
 - Wait and retry later
 
-**Career page scraping fails:**
-- Some ATS providers have anti-bot protection
-- The tool gracefully skips failed pages
-
-**Low duplication rate:**
-- Career pages may have different job counts
-- Title variations may affect matching
-- Some companies post LinkedIn-exclusive jobs
+**Block detected:**
+- The tool stops immediately on authwall/captcha
+- Partial results are preserved
+- Wait before retrying
 
 ## License
 

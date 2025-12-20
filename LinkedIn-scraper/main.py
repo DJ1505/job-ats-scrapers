@@ -1,11 +1,18 @@
 """
-LinkedIn Job Duplication Research Tool
+LinkedIn Job Ingestion Pipeline
 
-This script researches whether LinkedIn jobs are duplicates of company career page postings
-or if they are exclusive to LinkedIn. Uses Playwright for network interception.
+Production-grade, API-first job ingestion system for LinkedIn jobs.
+Uses network interception (no login), ATS JSON APIs, and safe scraping practices.
+
+ARCHITECTURE:
+- LinkedIn Guest APIs are the PRIMARY data source
+- ATS JSON APIs (Greenhouse, Lever, Workday, etc.) for external jobs
+- No DOM scraping for job data
+- Immediate abort on login/captcha detection
 
 Usage:
     python main.py --keywords "software engineer" --location "San Francisco" --max-jobs 20
+    python main.py --keywords "data scientist" --no-ats  # Skip ATS fetching
 """
 import argparse
 import asyncio
@@ -13,311 +20,252 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
 import pandas as pd
 
 from schemas import (
     JobPosting,
-    ResearchReport,
-    DuplicationResult,
-    CompanyInfo,
+    JobOrigin,
+    PipelineResult,
     ATSProvider,
+    BlockReason,
 )
-from linkedin_scraper import LinkedInScraper
-from career_page_scraper import CareerPageScraper
-from job_comparator import JobComparator
-from ats_detector import detect_ats_from_url, extract_career_page_base_url
+from job_pipeline import JobIngestionPipeline, run_pipeline
 
 console = Console()
 
 
-async def run_research(
+async def run_ingestion(
     keywords: str = "software engineer",
     location: str = "",
     max_jobs: int = 10,
     headless: bool = True,
     output_dir: str = "results",
-) -> ResearchReport:
+    fetch_ats: bool = True,
+) -> PipelineResult:
     """
-    Run the LinkedIn job duplication research.
+    Run the job ingestion pipeline.
     
-    Steps:
-    1. Search LinkedIn for jobs matching criteria
-    2. For each job, extract the apply URL and detect ATS
-    3. If external apply URL found, scrape the career page
-    4. Compare jobs to detect duplicates
-    5. Generate report
+    Pipeline steps:
+    1. Discover jobs via LinkedIn Guest API (network interception)
+    2. Classify jobs by origin (ATS vs LINKEDIN_NATIVE)
+    3. For ATS jobs: fetch directly from ATS JSON APIs
+    4. Deduplicate and normalize all jobs
     """
-    report = ResearchReport()
-    linkedin_jobs: list[JobPosting] = []
-    career_page_jobs: list[JobPosting] = []
-    comparator = JobComparator()
-    
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
     
     console.print(Panel.fit(
-        "[bold blue]LinkedIn Job Duplication Research[/bold blue]\n"
+        "[bold blue]LinkedIn Job Ingestion Pipeline[/bold blue]\n"
         f"Keywords: {keywords or 'Any'}\n"
         f"Location: {location or 'Any'}\n"
-        f"Max Jobs: {max_jobs}",
-        title="Research Parameters",
+        f"Max Jobs: {max_jobs}\n"
+        f"Fetch ATS: {fetch_ats}",
+        title="Pipeline Configuration",
     ))
     
-    async with LinkedInScraper(headless=headless) as scraper:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Searching LinkedIn jobs...", total=None)
-            
-            async for job in scraper.search_jobs_guest(
-                keywords=keywords,
-                location=location,
-                max_jobs=max_jobs,
-            ):
-                linkedin_jobs.append(job)
-                progress.update(task, description=f"Found {len(linkedin_jobs)} jobs...")
-            
-            progress.update(task, description=f"[green]Collected {len(linkedin_jobs)} LinkedIn jobs[/green]")
-        
-        if not linkedin_jobs:
-            console.print("[yellow]No LinkedIn jobs found. The search may have been blocked.[/yellow]")
-            console.print("[yellow]Try running with --no-headless to see what's happening.[/yellow]")
-            return report
-        
-        _display_linkedin_jobs_table(linkedin_jobs)
-        
-        career_urls_to_scrape: dict[str, list[JobPosting]] = {}
-        
-        for job in linkedin_jobs:
-            if job.apply_url and job.external_apply:
-                base_url = extract_career_page_base_url(job.apply_url)
-                if base_url:
-                    if base_url not in career_urls_to_scrape:
-                        career_urls_to_scrape[base_url] = []
-                    career_urls_to_scrape[base_url].append(job)
-        
-        console.print(f"\n[blue]Found {len(career_urls_to_scrape)} unique career pages to check[/blue]")
-        
-        if career_urls_to_scrape:
-            career_scraper = CareerPageScraper(scraper.context)
-            
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
-                for career_url, jobs in career_urls_to_scrape.items():
-                    company_name = jobs[0].company_name
-                    task = progress.add_task(f"Scraping {company_name}...", total=None)
-                    
-                    try:
-                        async for cp_job in career_scraper.scrape_career_page(
-                            career_url,
-                            company_name,
-                            max_jobs=30,
-                        ):
-                            career_page_jobs.append(cp_job)
-                    except Exception as e:
-                        console.print(f"[yellow]Error scraping {career_url}: {e}[/yellow]")
-                    
-                    progress.update(task, completed=True)
+    result: PipelineResult
     
-    console.print(f"\n[green]Scraped {len(career_page_jobs)} jobs from career pages[/green]")
+    async with JobIngestionPipeline(
+        headless=headless,
+        fetch_ats_jobs=fetch_ats,
+    ) as pipeline:
+        result = await pipeline.run(
+            keywords=keywords,
+            location=location,
+            max_jobs=max_jobs,
+        )
     
-    console.print("\n[blue]Comparing jobs for duplicates...[/blue]")
-    results = comparator.batch_compare(linkedin_jobs, career_page_jobs)
+    if not result.jobs:
+        if result.scraper_state.is_blocked:
+            console.print("[red]Pipeline was blocked. Partial results may be available.[/red]")
+            console.print(f"[red]Block reason: {result.scraper_state.block_reason}[/red]")
+        else:
+            console.print("[yellow]No jobs found. Try different search terms.[/yellow]")
+        return result
     
-    duplicates = [r for r in results if r.is_duplicate]
-    linkedin_only = [r for r in results if not r.is_duplicate]
+    _display_jobs_table(result.jobs)
+    _display_pipeline_results(result)
+    _save_pipeline_results(result, output_path)
     
-    report.total_linkedin_jobs_analyzed = len(linkedin_jobs)
-    report.total_career_page_jobs_found = len(career_page_jobs)
-    report.confirmed_duplicates = len(duplicates)
-    report.linkedin_only_jobs = len(linkedin_only)
-    report.duplication_rate = (len(duplicates) / len(linkedin_jobs) * 100) if linkedin_jobs else 0
-    report.results = results
-    
-    ats_counts: dict[str, int] = {}
-    for job in linkedin_jobs:
-        if job.ats_provider:
-            ats_name = job.ats_provider.value
-            ats_counts[ats_name] = ats_counts.get(ats_name, 0) + 1
-    report.ats_distribution = ats_counts
-    
-    companies_analyzed: dict[str, CompanyInfo] = {}
-    for job in linkedin_jobs:
-        company = job.company_name
-        if company not in companies_analyzed:
-            companies_analyzed[company] = CompanyInfo(name=company)
-        companies_analyzed[company].jobs_on_linkedin += 1
-        if job.ats_provider:
-            companies_analyzed[company].detected_ats = job.ats_provider
-    
-    for job in career_page_jobs:
-        company = job.company_name
-        if company in companies_analyzed:
-            companies_analyzed[company].jobs_on_career_page += 1
-    
-    for result in duplicates:
-        company = result.linkedin_job.company_name
-        if company in companies_analyzed:
-            companies_analyzed[company].duplicates_found += 1
-    
-    report.companies_analyzed = list(companies_analyzed.values())
-    
-    _display_results(report)
-    _save_results(report, output_path)
-    
-    return report
+    return result
 
 
-def _display_linkedin_jobs_table(jobs: list[JobPosting]) -> None:
-    """Display LinkedIn jobs in a table."""
-    table = Table(title="LinkedIn Jobs Found", show_lines=True)
+def _display_jobs_table(jobs: list[JobPosting]) -> None:
+    """Display jobs in a table."""
+    table = Table(title="Jobs Extracted", show_lines=True)
     table.add_column("Title", style="cyan", max_width=40)
     table.add_column("Company", style="green")
     table.add_column("Location", style="yellow")
-    table.add_column("Apply Type", style="magenta")
+    table.add_column("Origin", style="magenta")
     table.add_column("ATS", style="blue")
+    table.add_column("Method", style="dim")
     
-    for job in jobs[:20]:
-        apply_type = "Easy Apply" if job.easy_apply else "External"
+    for job in jobs[:25]:
+        origin = "[green]ATS[/green]" if job.job_origin == JobOrigin.ATS else "[blue]Native[/blue]"
         ats = job.ats_provider.value if job.ats_provider else "-"
         table.add_row(
             job.title[:40],
             job.company_name[:25],
             (job.location or "-")[:20],
-            apply_type,
+            origin,
             ats,
+            job.extraction_method,
         )
     
-    if len(jobs) > 20:
-        table.add_row("...", f"({len(jobs) - 20} more)", "...", "...", "...")
+    if len(jobs) > 25:
+        table.add_row("...", f"({len(jobs) - 25} more)", "...", "...", "...", "...")
     
     console.print(table)
 
 
-def _display_results(report: ResearchReport) -> None:
-    """Display research results."""
+def _display_pipeline_results(result: PipelineResult) -> None:
+    """Display pipeline results."""
+    ats_count = sum(1 for j in result.jobs if j.job_origin == JobOrigin.ATS)
+    native_count = sum(1 for j in result.jobs if j.job_origin == JobOrigin.LINKEDIN_NATIVE)
+    
     console.print("\n")
     console.print(Panel.fit(
-        f"[bold]Total LinkedIn Jobs Analyzed:[/bold] {report.total_linkedin_jobs_analyzed}\n"
-        f"[bold]Career Page Jobs Found:[/bold] {report.total_career_page_jobs_found}\n"
-        f"[bold]Confirmed Duplicates:[/bold] {report.confirmed_duplicates}\n"
-        f"[bold]LinkedIn-Only Jobs:[/bold] {report.linkedin_only_jobs}\n"
-        f"[bold green]Duplication Rate:[/bold green] {report.duplication_rate:.1f}%",
-        title="Research Results",
+        f"[bold]Total Jobs Extracted:[/bold] {len(result.jobs)}\n"
+        f"[bold]ATS Jobs:[/bold] {ats_count}\n"
+        f"[bold]LinkedIn-Native Jobs:[/bold] {native_count}\n"
+        f"[bold]ATS Companies Detected:[/bold] {len(result.ats_companies)}\n"
+        f"[bold]LinkedIn-Native Companies:[/bold] {len(result.linkedin_native_companies)}",
+        title="Pipeline Results",
         border_style="green",
     ))
     
-    if report.ats_distribution:
+    ats_distribution: dict[str, int] = {}
+    for job in result.jobs:
+        if job.ats_provider and job.ats_provider != ATSProvider.UNKNOWN:
+            ats_name = job.ats_provider.value
+            ats_distribution[ats_name] = ats_distribution.get(ats_name, 0) + 1
+    
+    if ats_distribution:
         table = Table(title="ATS Distribution")
         table.add_column("ATS Provider", style="cyan")
         table.add_column("Job Count", style="green")
         table.add_column("Percentage", style="yellow")
         
-        total = sum(report.ats_distribution.values())
-        for ats, count in sorted(report.ats_distribution.items(), key=lambda x: -x[1]):
+        total = sum(ats_distribution.values())
+        for ats, count in sorted(ats_distribution.items(), key=lambda x: -x[1]):
             pct = (count / total * 100) if total else 0
             table.add_row(ats, str(count), f"{pct:.1f}%")
         
         console.print(table)
     
-    if report.results:
-        table = Table(title="Duplicate Detection Results (Sample)")
-        table.add_column("LinkedIn Job", style="cyan", max_width=35)
-        table.add_column("Company", style="green")
-        table.add_column("Is Duplicate?", style="magenta")
-        table.add_column("Similarity", style="yellow")
-        table.add_column("Match Method", style="blue")
+    origin_distribution: dict[str, int] = {}
+    for job in result.jobs:
+        origin = job.job_origin.value
+        origin_distribution[origin] = origin_distribution.get(origin, 0) + 1
+    
+    if origin_distribution:
+        table = Table(title="Job Origin Distribution")
+        table.add_column("Origin", style="cyan")
+        table.add_column("Count", style="green")
+        table.add_column("Percentage", style="yellow")
         
-        for result in report.results[:15]:
-            is_dup = "[green]✓ Yes[/green]" if result.is_duplicate else "[red]✗ No[/red]"
-            table.add_row(
-                result.linkedin_job.title[:35],
-                result.linkedin_job.company_name[:20],
-                is_dup,
-                f"{result.similarity_score:.0f}%",
-                result.match_method or "-",
-            )
+        total = len(result.jobs)
+        for origin, count in sorted(origin_distribution.items(), key=lambda x: -x[1]):
+            pct = (count / total * 100) if total else 0
+            table.add_row(origin, str(count), f"{pct:.1f}%")
         
         console.print(table)
+    
+    if result.scraper_state.is_blocked:
+        console.print(Panel.fit(
+            f"[red bold]Scraper was blocked![/red bold]\n"
+            f"Reason: {result.scraper_state.block_reason.value if result.scraper_state.block_reason else 'Unknown'}",
+            title="⚠️ Block Detected",
+            border_style="red",
+        ))
+    
+    if result.errors:
+        console.print(f"\n[yellow]Errors encountered: {len(result.errors)}[/yellow]")
+        for error in result.errors[:5]:
+            console.print(f"  - {error}")
 
 
-def _save_results(report: ResearchReport, output_path: Path) -> None:
-    """Save results to files."""
+def _save_pipeline_results(result: PipelineResult, output_path: Path) -> None:
+    """Save pipeline results to files."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    json_path = output_path / f"research_report_{timestamp}.json"
+    json_path = output_path / f"pipeline_result_{timestamp}.json"
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report.model_dump(mode="json"), f, indent=2, default=str)
+        json.dump(result.model_dump(mode="json"), f, indent=2, default=str)
     console.print(f"[green]Saved JSON report to:[/green] {json_path}")
     
-    if report.results:
+    if result.jobs:
         rows = []
-        for result in report.results:
-            job = result.linkedin_job
+        for job in result.jobs:
             rows.append({
                 "job_id": job.job_id,
                 "title": job.title,
-                "company": job.company_name,
+                "company_name": job.company_name,
                 "location": job.location,
+                "apply_url": job.apply_url,
+                "ats_provider": job.ats_provider.value if job.ats_provider else None,
+                "job_origin": job.job_origin.value,
+                "source_url": job.source_url,
+                "extracted_at": job.extracted_at.isoformat() if job.extracted_at else None,
+                "extraction_method": job.extraction_method,
                 "easy_apply": job.easy_apply,
                 "external_apply": job.external_apply,
-                "ats_provider": job.ats_provider.value if job.ats_provider else None,
-                "apply_url": job.apply_url,
-                "is_duplicate": result.is_duplicate,
-                "similarity_score": result.similarity_score,
-                "match_method": result.match_method,
             })
         
         df = pd.DataFrame(rows)
-        csv_path = output_path / f"jobs_analysis_{timestamp}.csv"
+        csv_path = output_path / f"jobs_{timestamp}.csv"
         df.to_csv(csv_path, index=False)
-        console.print(f"[green]Saved CSV analysis to:[/green] {csv_path}")
+        console.print(f"[green]Saved jobs CSV to:[/green] {csv_path}")
+    
+    ats_count = sum(1 for j in result.jobs if j.job_origin == JobOrigin.ATS)
+    native_count = sum(1 for j in result.jobs if j.job_origin == JobOrigin.LINKEDIN_NATIVE)
     
     summary_path = output_path / f"summary_{timestamp}.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("LinkedIn Job Duplication Research Summary\n")
+        f.write("LinkedIn Job Ingestion Pipeline Summary\n")
         f.write("=" * 50 + "\n\n")
-        f.write(f"Generated: {report.generated_at}\n\n")
-        f.write(f"Total LinkedIn Jobs Analyzed: {report.total_linkedin_jobs_analyzed}\n")
-        f.write(f"Career Page Jobs Found: {report.total_career_page_jobs_found}\n")
-        f.write(f"Confirmed Duplicates: {report.confirmed_duplicates}\n")
-        f.write(f"LinkedIn-Only Jobs: {report.linkedin_only_jobs}\n")
-        f.write(f"Duplication Rate: {report.duplication_rate:.1f}%\n\n")
+        f.write(f"Generated: {result.completed_at}\n\n")
+        f.write(f"Total Jobs Extracted: {len(result.jobs)}\n")
+        f.write(f"ATS Jobs: {ats_count}\n")
+        f.write(f"LinkedIn-Native Jobs: {native_count}\n")
+        f.write(f"ATS Companies Detected: {len(result.ats_companies)}\n\n")
         
-        f.write("Key Finding:\n")
-        if report.duplication_rate > 70:
-            f.write("Most LinkedIn jobs ARE duplicates from company career pages/ATS.\n")
-        elif report.duplication_rate > 40:
-            f.write("A significant portion of LinkedIn jobs are duplicates from career pages.\n")
-        else:
-            f.write("Many LinkedIn jobs appear to be unique or couldn't be matched to career pages.\n")
+        if result.ats_companies:
+            f.write("ATS Companies:\n")
+            for company_key, info in result.ats_companies.items():
+                f.write(f"  - {info.company_name}: {info.ats_provider.value} ({info.job_count} jobs)\n")
         
-        f.write("\nATS Distribution:\n")
-        for ats, count in report.ats_distribution.items():
-            f.write(f"  - {ats}: {count} jobs\n")
+        if result.linkedin_native_companies:
+            f.write(f"\nLinkedIn-Native Companies ({len(result.linkedin_native_companies)}):\n")
+            for company in result.linkedin_native_companies[:10]:
+                f.write(f"  - {company}\n")
+            if len(result.linkedin_native_companies) > 10:
+                f.write(f"  ... and {len(result.linkedin_native_companies) - 10} more\n")
+        
+        if result.scraper_state.is_blocked:
+            f.write(f"\n⚠️ BLOCKED: {result.scraper_state.block_reason}\n")
+        
+        if result.errors:
+            f.write(f"\nErrors ({len(result.errors)}):\n")
+            for error in result.errors:
+                f.write(f"  - {error}\n")
     
     console.print(f"[green]Saved summary to:[/green] {summary_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Research LinkedIn job duplication from ATS/career pages",
+        description="LinkedIn Job Ingestion Pipeline - API-first job extraction",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     python main.py --keywords "data scientist" --location "New York"
     python main.py --keywords "product manager" --max-jobs 30
     python main.py --no-headless  # Run with visible browser
+    python main.py --no-ats  # Skip ATS job fetching
         """,
     )
     
@@ -337,12 +285,17 @@ Examples:
         "--max-jobs",
         type=int,
         default=10,
-        help="Maximum number of jobs to analyze (default: 10)",
+        help="Maximum number of jobs to extract (default: 10)",
     )
     parser.add_argument(
         "--no-headless",
         action="store_true",
         help="Run browser in visible mode for debugging",
+    )
+    parser.add_argument(
+        "--no-ats",
+        action="store_true",
+        help="Skip fetching jobs from ATS APIs",
     )
     parser.add_argument(
         "--output-dir",
@@ -354,15 +307,16 @@ Examples:
     args = parser.parse_args()
     
     try:
-        asyncio.run(run_research(
+        asyncio.run(run_ingestion(
             keywords=args.keywords,
             location=args.location,
             max_jobs=args.max_jobs,
             headless=not args.no_headless,
             output_dir=args.output_dir,
+            fetch_ats=not args.no_ats,
         ))
     except KeyboardInterrupt:
-        console.print("\n[yellow]Research interrupted by user[/yellow]")
+        console.print("\n[yellow]Pipeline interrupted by user[/yellow]")
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
         raise
